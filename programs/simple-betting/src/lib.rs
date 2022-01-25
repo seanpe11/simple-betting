@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 use std::convert::{Into, From, TryFrom};
+use spl_token::instruction::AuthorityType;
 
 declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 
@@ -8,31 +9,31 @@ declare_id!("Fg6PaFpoGXkYsidMpWTK6W2BeZ7FEfcYkg476zPFsLnS");
 pub mod simple_betting {
     use super::*;
 
+    const SOLPREDICT_PDA_SEED: &[u8] = b"solpredict";
+
     // processors
     pub fn intialize_betting(
         ctx: Context<InitializeBetting>, 
-        authority: Pubkey,
         house_edge: u8
     ) -> ProgramResult {
         let betting_round = &mut ctx.accounts.betting_round;
         betting_round.round_id = 0;
-        betting_round.authority = authority;
+        betting_round.authority = *ctx.accounts.authority.to_account_info().key;
         betting_round.bull_bets = 0;
         betting_round.bear_bets = 0;
         betting_round.house_edge = house_edge;
         betting_round.bull_win = true;
+        betting_round.cancelled = false;
         betting_round.finalized = false;
-
-        // initialize vault to keep balances
 
         Ok(())
     }
     pub fn place_bet(ctx: Context<PlaceBet>, amount: u64, bull_bet: bool) -> ProgramResult {
         let bet_account = &mut ctx.accounts.placed_bet;
-        bet_account.bettor = ctx.accounts.bettor.key();
+        bet_account.bettor = *ctx.accounts.bettor.to_account_info().key;
         bet_account.bet = amount;
         bet_account.bet_bull = bull_bet;
-        bet_account.betting_round = ctx.accounts.betting_round.key();
+        bet_account.betting_round = *ctx.accounts.betting_round.to_account_info().key;
 
         let betting_round = &mut ctx.accounts.betting_round;
         if bull_bet {
@@ -42,6 +43,7 @@ pub mod simple_betting {
         };
 
         // TODO: transfer tokens from bettor to PDA
+
         let cpi_accounts = Transfer {
             from: ctx.accounts.bettor_token_account.to_account_info().clone(),
             to: ctx.accounts.vault_token_account.to_account_info().clone(),
@@ -71,13 +73,17 @@ pub mod simple_betting {
             ).unwrap();
         
         // payout to edge account
+        let (_pda, bump_seed) = Pubkey::find_program_address(&[SOLPREDICT_PDA_SEED], ctx.program_id);
+        let seeds = &[&SOLPREDICT_PDA_SEED[..], &[bump_seed]];
+        let signer = &[&seeds[..]];
+
         let cpi_accounts = Transfer {
             from: ctx.accounts.vault_token_account.to_account_info().clone(),
             to: ctx.accounts.edge_token_account.to_account_info().clone(),
             authority: ctx.accounts.vault.to_account_info().clone(),
         };
         let cpi_program = ctx.accounts.token_program.clone();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
         token::transfer(cpi_ctx, edge)?;
 
         msg!(
@@ -109,14 +115,42 @@ pub mod simple_betting {
         msg!("Paid out {} to winning bettor", token_payout);
 
         // TODO: transfer tokens from PDA to bettor
+        let (_pda, bump_seed) = Pubkey::find_program_address(&[SOLPREDICT_PDA_SEED], ctx.program_id);
+        let seeds = &[&SOLPREDICT_PDA_SEED[..], &[bump_seed]];
+        let signer = &[&seeds[..]];
+
         let cpi_accounts = Transfer {
             from: ctx.accounts.vault_token_account.to_account_info().clone(),
             to: ctx.accounts.bettor_token_account.to_account_info().clone(),
             authority: ctx.accounts.vault.to_account_info().clone(),
         };
         let cpi_program = ctx.accounts.token_program.clone();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
         token::transfer(cpi_ctx, token_payout)?;
+
+        Ok(())
+    }
+    pub fn cancel_round(ctx: Context<CancelRound>) -> ProgramResult {
+        let betting_round = &mut ctx.accounts.betting_round;
+        betting_round.cancelled = true;
+
+        Ok(())
+    }
+    pub fn claim_cancelled(ctx: Context<ClaimCancelled>) -> ProgramResult {
+
+        // TODO: transfer tokens from PDA to bettor
+        let (_pda, bump_seed) = Pubkey::find_program_address(&[SOLPREDICT_PDA_SEED], ctx.program_id);
+        let seeds = &[&SOLPREDICT_PDA_SEED[..], &[bump_seed]];
+        let signer = &[&seeds[..]];
+        
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.vault_token_account.to_account_info().clone(),
+            to: ctx.accounts.bettor_token_account.to_account_info().clone(),
+            authority: ctx.accounts.vault.to_account_info().clone(),
+        };
+        let cpi_program = ctx.accounts.token_program.clone();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::transfer(cpi_ctx, ctx.accounts.bet_account.bet)?;
 
         Ok(())
     }
@@ -139,14 +173,24 @@ pub struct InitializeBetting<'info> {
 pub struct PlaceBet<'info> {
     #[account(init, payer = bettor, space = 8 + BetAccount::LEN)]
     pub placed_bet: Account<'info, BetAccount>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = betting_round.finalized == false,
+        constraint = betting_round.cancelled == false
+    )]
     pub betting_round: Account<'info, BettingRound>,
-    #[account(mut)]
+     #[account(
+        mut,
+        constraint = bettor_token_account.to_account_info().owner == bettor.to_account_info().key
+    )]
     pub bettor_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
     pub bettor: Signer<'info>,
     pub system_program: Program<'info, System>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = vault_token_account.to_account_info().owner == vault.to_account_info().key
+    )]
     pub vault_token_account: Account<'info, TokenAccount>,
     pub vault: AccountInfo<'info>,
     pub token_program: AccountInfo<'info>,
@@ -170,7 +214,10 @@ pub struct ClaimBet<'info> {
         constraint = betting_round.finalized == true
     )]
     pub bet_account: Account<'info, BetAccount>,
-    #[account(mut)]
+     #[account(
+        mut,
+        constraint = bettor_token_account.to_account_info().owner == bettor.to_account_info().key
+    )]
     pub bettor_token_account: Account<'info, TokenAccount>,
     pub bettor: Signer<'info>,
     #[account(mut)]
@@ -179,21 +226,47 @@ pub struct ClaimBet<'info> {
     pub betting_round: Account<'info, BettingRound>,
     pub token_program: AccountInfo<'info>,
 }
+#[derive(Accounts)]
+pub struct ClaimCancelled<'info> {
+    #[account(mut, has_one = bettor, 
+        constraint = bet_account.bet_bull == betting_round.bull_win,
+        constraint = betting_round.cancelled == true
+    )]
+    pub bet_account: Account<'info, BetAccount>,
+     #[account(
+        mut,
+        constraint = bettor_token_account.to_account_info().owner == bettor.to_account_info().key
+    )]
+    pub bettor_token_account: Account<'info, TokenAccount>,
+    pub bettor: Signer<'info>,
+    #[account(mut)]
+    pub vault_token_account: Account<'info, TokenAccount>,
+    pub vault: AccountInfo<'info>,
+    pub betting_round: Account<'info, BettingRound>,
+    pub token_program: AccountInfo<'info>,
+}
+#[derive(Accounts)]
+pub struct CancelRound<'info> {
+    #[account(mut, has_one = authority)]
+    pub betting_round: Account<'info, BettingRound>,
+    pub authority: Signer<'info>,
+}
 
 // accounts
 #[account]
 pub struct BettingRound {
-    pub authority: Pubkey,
     pub round_id: u64,
     pub bull_win: bool,
     pub finalized: bool,
+    pub cancelled: bool,
     pub bull_bets: u64,
     pub bear_bets: u64,
     pub house_edge: u8,
+    pub authority: Pubkey,
     pub vault: Pubkey,
 }
 impl BettingRound {
-    pub const LEN: usize = 32 + 8 + 8 + 8 + 1 + 1 + 8 + 8 + 8 + 32;
+    pub const LEN: usize = 8 + 1 + 1 + 1 + 8 + 8 + 1 + 32 + 32;
 }
 #[account]
 pub struct BetAccount {
